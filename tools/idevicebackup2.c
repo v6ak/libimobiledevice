@@ -1559,6 +1559,13 @@ static int local_unpack_backup(const char *backup_dir, const char *source_udid, 
 
 		/* Create destination directory */
 		char *dest_dir = strdup(dest_path);
+		if (!dest_dir) {
+			error_count++;
+			PRINT_VERBOSE(2, "WARNING: Memory allocation failed for: %s\n", dest_path);
+			free(source_file);
+			free(dest_path);
+			continue;
+		}
 		char *last_slash = strrchr(dest_dir, '/');
 		if (last_slash) {
 			*last_slash = '\0';
