@@ -72,6 +72,10 @@ idevicebackup_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
 idevicebackup2_SOURCES = idevicebackup2.c
 idevicebackup2_CFLAGS = $(AM_CFLAGS) $(limd_glue_CFLAGS)
 idevicebackup2_LDFLAGS = $(AM_LDFLAGS) $(limd_glue_LIBS)
+if HAVE_SQLITE3
+  idevicebackup2_CFLAGS += $(sqlite3_CFLAGS)
+  idevicebackup2_LDFLAGS += $(sqlite3_LIBS)
+endif
 idevicebackup2_LDADD = $(top_builddir)/src/libimobiledevice-1.0.la
 
 ideviceimagemounter_SOURCES = ideviceimagemounter.c
