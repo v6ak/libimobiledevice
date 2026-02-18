@@ -1483,7 +1483,7 @@ static void print_usage(int argc, char **argv, int is_error)
  * Local unpacking of iOS backup without device connection
  * Reads Manifest.db and copies files from hash names to original paths in _unback_ subdirectory
  */
-static int local_unpack_backup(const char *backup_dir, const char *source_udid, const char *backup_password)
+static int local_unpack_backup(const char *backup_dir, const char *source_udid, uint8_t is_encrypted)
 {
 	char *manifest_db_path = string_build_path(backup_dir, source_udid, "Manifest.db", NULL);
 	char *unback_dir = string_build_path(backup_dir, source_udid, "_unback_", NULL);
@@ -1504,7 +1504,7 @@ static int local_unpack_backup(const char *backup_dir, const char *source_udid, 
 	}
 
 	/* Check if backup is encrypted */
-	if (backup_password != NULL) {
+	if (is_encrypted) {
 		printf("ERROR: Encrypted backups are not supported for local unpacking.\n");
 		printf("NOTE: Please connect your device to unpack encrypted backups.\n");
 		free(manifest_db_path);
@@ -1515,7 +1515,10 @@ static int local_unpack_backup(const char *backup_dir, const char *source_udid, 
 	/* Open SQLite database */
 	rc = sqlite3_open(manifest_db_path, &db);
 	if (rc != SQLITE_OK) {
-		printf("ERROR: Cannot open Manifest.db: %s\n", sqlite3_errmsg(db));
+		printf("ERROR: Cannot open Manifest.db: %s\n", sqlite3_errstr(rc));
+		if (db) {
+			sqlite3_close(db);
+		}
 		free(manifest_db_path);
 		free(unback_dir);
 		return -1;
@@ -1570,13 +1573,22 @@ static int local_unpack_backup(const char *backup_dir, const char *source_udid, 
 			if (dst_fp) {
 				char buffer[32768];
 				size_t bytes_read;
+				int write_error = 0;
 				while ((bytes_read = fread(buffer, 1, sizeof(buffer), src_fp)) > 0) {
-					fwrite(buffer, 1, bytes_read, dst_fp);
+					size_t bytes_written = fwrite(buffer, 1, bytes_read, dst_fp);
+					if (bytes_written != bytes_read) {
+						write_error = 1;
+						error_count++;
+						PRINT_VERBOSE(2, "WARNING: Failed to write complete data for: %s\n", dest_path);
+						break;
+					}
 				}
 				fclose(dst_fp);
-				file_count++;
-				if (file_count % 100 == 0) {
-					PRINT_VERBOSE(1, "Unpacked %d files...\n", file_count);
+				if (!write_error) {
+					file_count++;
+					if (file_count % 100 == 0) {
+						PRINT_VERBOSE(1, "Unpacked %d files...\n", file_count);
+					}
 				}
 			} else {
 				error_count++;
@@ -1883,17 +1895,48 @@ int main(int argc, char *argv[])
 			if (dir) {
 				struct dirent *entry;
 				while ((entry = readdir(dir)) != NULL) {
+					/* Skip . and .. */
+					if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+						continue;
+					}
+					
 					/* Look for directories that look like UDIDs (40-char hex strings) */
-					if (entry->d_type == DT_DIR && strlen(entry->d_name) == 40) {
-						/* Check if this directory has Info.plist */
-						char *test_path = string_build_path(backup_directory, entry->d_name, "Info.plist", NULL);
-						if (stat(test_path, &st) == 0) {
-							source_udid = strdup(entry->d_name);
-							PRINT_VERBOSE(1, "Auto-detected backup UDID: %s\n", source_udid);
-							free(test_path);
-							break;
+					if (strlen(entry->d_name) == 40) {
+						/* Validate it's a hex string */
+						int is_hex = 1;
+						for (int j = 0; j < 40; j++) {
+							char c = entry->d_name[j];
+							if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+								is_hex = 0;
+								break;
+							}
 						}
-						free(test_path);
+						
+						if (!is_hex) {
+							continue;
+						}
+						
+						/* Build full path and check if it's a directory with Info.plist */
+						char *test_dir = string_build_path(backup_directory, entry->d_name, NULL);
+						if (stat(test_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+							char *test_path = string_build_path(backup_directory, entry->d_name, "Info.plist", NULL);
+							if (stat(test_path, &st) == 0) {
+								source_udid = strdup(entry->d_name);
+								if (!source_udid) {
+									fprintf(stderr, "ERROR: Memory allocation failed\n");
+									free(test_path);
+									free(test_dir);
+									closedir(dir);
+									return -1;
+								}
+								PRINT_VERBOSE(1, "Auto-detected backup UDID: %s\n", source_udid);
+								free(test_path);
+								free(test_dir);
+								break;
+							}
+							free(test_path);
+						}
+						free(test_dir);
 					}
 				}
 				closedir(dir);
@@ -1928,9 +1971,13 @@ int main(int argc, char *argv[])
 
 		/* Get password if needed */
 		if (is_encrypted && backup_password == NULL) {
-			backup_password = getenv("BACKUP_PASSWORD");
-			if (backup_password) {
-				backup_password = strdup(backup_password);
+			const char *env_password = getenv("BACKUP_PASSWORD");
+			if (env_password) {
+				backup_password = strdup(env_password);
+				if (!backup_password) {
+					fprintf(stderr, "ERROR: Memory allocation failed\n");
+					return -1;
+				}
 			}
 			if (backup_password == NULL && interactive_mode) {
 				backup_password = ask_for_password("Enter backup password", 0);
@@ -1938,7 +1985,7 @@ int main(int argc, char *argv[])
 		}
 
 		/* Perform local unpacking */
-		int result = local_unpack_backup(backup_directory, source_udid, is_encrypted ? backup_password : NULL);
+		int result = local_unpack_backup(backup_directory, source_udid, is_encrypted);
 		if (backup_password) {
 			free(backup_password);
 		}
