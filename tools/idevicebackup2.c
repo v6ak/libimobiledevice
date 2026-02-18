@@ -1559,7 +1559,7 @@ static int local_unpack_backup(const char *backup_dir, const char *source_udid, 
 		char *last_slash = strrchr(dest_dir, '/');
 		if (last_slash) {
 			*last_slash = '\0';
-			string_mkdir(dest_dir, 0755);
+			mkdir_with_parents(dest_dir, 0755);
 		}
 		free(dest_dir);
 
@@ -1878,8 +1878,33 @@ int main(int argc, char *argv[])
 	if (cmd == CMD_UNBACK) {
 		/* Ensure we have a source_udid for the backup */
 		if (!source_udid) {
-			fprintf(stderr, "ERROR: No source UDID specified. Use -s option to specify backup UDID.\n");
-			return -1;
+			/* Try to auto-detect UDID from backup directory */
+			DIR *dir = opendir(backup_directory);
+			if (dir) {
+				struct dirent *entry;
+				while ((entry = readdir(dir)) != NULL) {
+					/* Look for directories that look like UDIDs (40-char hex strings) */
+					if (entry->d_type == DT_DIR && strlen(entry->d_name) == 40) {
+						/* Check if this directory has Info.plist */
+						char *test_path = string_build_path(backup_directory, entry->d_name, "Info.plist", NULL);
+						if (stat(test_path, &st) == 0) {
+							source_udid = strdup(entry->d_name);
+							PRINT_VERBOSE(1, "Auto-detected backup UDID: %s\n", source_udid);
+							free(test_path);
+							break;
+						}
+						free(test_path);
+					}
+				}
+				closedir(dir);
+			}
+			
+			if (!source_udid) {
+				fprintf(stderr, "ERROR: Could not auto-detect backup UDID.\n");
+				fprintf(stderr, "Please use -s option to specify the backup UDID (40-character hex string).\n");
+				fprintf(stderr, "You can find it by looking at the subdirectory names in the backup directory.\n");
+				return -1;
+			}
 		}
 
 		/* Check for encrypted backup */
