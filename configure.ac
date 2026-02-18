@@ -58,6 +58,13 @@ if test "$check_libreadline" = "true"; then
 fi
 AM_CONDITIONAL([HAVE_READLINE],[test "x$have_readline" = "xyes"])
 
+# Check for SQLite3 for local backup unpacking in idevicebackup2
+PKG_CHECK_MODULES(sqlite3, sqlite3 >= 3.0, have_sqlite3=yes, have_sqlite3=no)
+if test "x$have_sqlite3" = "xyes"; then
+  AC_DEFINE(HAVE_SQLITE3, 1, [Define if sqlite3 library is available])
+fi
+AM_CONDITIONAL([HAVE_SQLITE3],[test "x$have_sqlite3" = "xyes"])
+
 # Checks for header files.
 AC_CHECK_HEADERS([stdint.h stdlib.h string.h sys/time.h])
 

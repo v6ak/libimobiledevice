@@ -51,6 +51,10 @@
 
 #include <endianness.h>
 
+#ifdef HAVE_SQLITE3
+#include <sqlite3.h>
+#endif
+
 #define LOCK_ATTEMPTS 50
 #define LOCK_WAIT 200000
 
@@ -1451,6 +1455,7 @@ static void print_usage(int argc, char **argv, int is_error)
 		"  info          show details about last completed backup of device\n"
 		"  list          list files of last completed backup in CSV format\n"
 		"  unback        unpack a completed backup in DIRECTORY/_unback_/\n"
+		"                (works without device for unencrypted modern backups)\n"
 		"  encryption on|off [PWD]       enable or disable backup encryption\n"
 		"  changepw [OLD NEW]    change backup password on target device\n"
 		"  cloud on|off          enable or disable cloud use (requires iCloud account)\n"
@@ -1472,6 +1477,140 @@ static void print_usage(int argc, char **argv, int is_error)
 		"Bug Reports: <" PACKAGE_BUGREPORT ">\n"
 	);
 }
+
+#ifdef HAVE_SQLITE3
+/**
+ * Local unpacking of iOS backup without device connection
+ * Reads Manifest.db and copies files from hash names to original paths in _unback_ subdirectory
+ */
+static int local_unpack_backup(const char *backup_dir, const char *source_udid, const char *backup_password)
+{
+	char *manifest_db_path = string_build_path(backup_dir, source_udid, "Manifest.db", NULL);
+	char *unback_dir = string_build_path(backup_dir, source_udid, "_unback_", NULL);
+	sqlite3 *db = NULL;
+	sqlite3_stmt *stmt = NULL;
+	int rc;
+	int file_count = 0;
+	int error_count = 0;
+
+	/* Check if Manifest.db exists */
+	struct stat st;
+	if (stat(manifest_db_path, &st) != 0) {
+		printf("ERROR: Manifest.db not found. This backup format is not supported for local unpacking.\n");
+		printf("NOTE: Only modern backups (iOS 10+) with Manifest.db are supported.\n");
+		free(manifest_db_path);
+		free(unback_dir);
+		return -1;
+	}
+
+	/* Check if backup is encrypted */
+	if (backup_password != NULL) {
+		printf("ERROR: Encrypted backups are not supported for local unpacking.\n");
+		printf("NOTE: Please connect your device to unpack encrypted backups.\n");
+		free(manifest_db_path);
+		free(unback_dir);
+		return -1;
+	}
+
+	/* Open SQLite database */
+	rc = sqlite3_open(manifest_db_path, &db);
+	if (rc != SQLITE_OK) {
+		printf("ERROR: Cannot open Manifest.db: %s\n", sqlite3_errmsg(db));
+		free(manifest_db_path);
+		free(unback_dir);
+		return -1;
+	}
+
+	/* Create _unback_ directory */
+	__mkdir(unback_dir, 0755);
+
+	PRINT_VERBOSE(1, "Starting local backup unpacking...\n");
+	PRINT_VERBOSE(1, "Reading Manifest.db...\n");
+
+	/* Query all files from the manifest */
+	const char *query = "SELECT fileID, domain, relativePath FROM Files WHERE relativePath IS NOT NULL AND relativePath != ''";
+	rc = sqlite3_prepare_v2(db, query, -1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		printf("ERROR: Failed to prepare SQL statement: %s\n", sqlite3_errmsg(db));
+		sqlite3_close(db);
+		free(manifest_db_path);
+		free(unback_dir);
+		return -1;
+	}
+
+	/* Process each file */
+	while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+		const char *file_id = (const char *)sqlite3_column_text(stmt, 0);
+		const char *domain = (const char *)sqlite3_column_text(stmt, 1);
+		const char *relative_path = (const char *)sqlite3_column_text(stmt, 2);
+
+		if (!file_id || !domain || !relative_path) {
+			continue;
+		}
+
+		/* Build source path (hash-based filename in backup) */
+		char *source_file = string_build_path(backup_dir, source_udid, file_id, NULL);
+
+		/* Build destination path (original path in _unback_) */
+		char *dest_path = string_build_path(unback_dir, domain, relative_path, NULL);
+
+		/* Create destination directory */
+		char *dest_dir = strdup(dest_path);
+		char *last_slash = strrchr(dest_dir, '/');
+		if (last_slash) {
+			*last_slash = '\0';
+			string_mkdir(dest_dir, 0755);
+		}
+		free(dest_dir);
+
+		/* Copy file */
+		FILE *src_fp = fopen(source_file, "rb");
+		if (src_fp) {
+			FILE *dst_fp = fopen(dest_path, "wb");
+			if (dst_fp) {
+				char buffer[32768];
+				size_t bytes_read;
+				while ((bytes_read = fread(buffer, 1, sizeof(buffer), src_fp)) > 0) {
+					fwrite(buffer, 1, bytes_read, dst_fp);
+				}
+				fclose(dst_fp);
+				file_count++;
+				if (file_count % 100 == 0) {
+					PRINT_VERBOSE(1, "Unpacked %d files...\n", file_count);
+				}
+			} else {
+				error_count++;
+				PRINT_VERBOSE(2, "WARNING: Could not create destination file: %s\n", dest_path);
+			}
+			fclose(src_fp);
+		} else {
+			error_count++;
+			PRINT_VERBOSE(2, "WARNING: Could not open source file: %s\n", source_file);
+		}
+
+		free(source_file);
+		free(dest_path);
+	}
+
+	if (rc != SQLITE_DONE) {
+		printf("ERROR: SQL query failed: %s\n", sqlite3_errmsg(db));
+	}
+
+	sqlite3_finalize(stmt);
+	sqlite3_close(db);
+	free(manifest_db_path);
+	free(unback_dir);
+
+	if (error_count > 0) {
+		PRINT_VERBOSE(1, "Unpacked %d files with %d errors.\n", file_count, error_count);
+	} else {
+		PRINT_VERBOSE(1, "Successfully unpacked %d files.\n", file_count);
+	}
+	PRINT_VERBOSE(1, "The files can now be found in the \"_unback_\" directory.\n");
+
+	return (error_count > 0) ? 1 : 0;
+}
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -1733,6 +1872,61 @@ int main(int argc, char *argv[])
 			return -1;
 		}
 	}
+
+#ifdef HAVE_SQLITE3
+	/* For CMD_UNBACK, we can do local unpacking without device connection */
+	if (cmd == CMD_UNBACK) {
+		/* Ensure we have a source_udid for the backup */
+		if (!source_udid) {
+			fprintf(stderr, "ERROR: No source UDID specified. Use -s option to specify backup UDID.\n");
+			return -1;
+		}
+
+		/* Check for encrypted backup */
+		char *manifest_path = string_build_path(backup_directory, source_udid, "Manifest.plist", NULL);
+		uint8_t is_encrypted = 0;
+		if (stat(manifest_path, &st) != 0) {
+			/* Manifest.plist doesn't exist, might be encrypted (Manifest.mbdx) or newer format */
+			free(manifest_path);
+		} else {
+			plist_t manifest_plist = NULL;
+			plist_read_from_file(manifest_path, &manifest_plist, NULL);
+			if (manifest_plist) {
+				plist_t node_tmp = plist_dict_get_item(manifest_plist, "IsEncrypted");
+				if (node_tmp && (plist_get_node_type(node_tmp) == PLIST_BOOLEAN)) {
+					plist_get_bool_val(node_tmp, &is_encrypted);
+				}
+				plist_free(manifest_plist);
+			}
+			free(manifest_path);
+		}
+
+		/* Get password if needed */
+		if (is_encrypted && backup_password == NULL) {
+			backup_password = getenv("BACKUP_PASSWORD");
+			if (backup_password) {
+				backup_password = strdup(backup_password);
+			}
+			if (backup_password == NULL && interactive_mode) {
+				backup_password = ask_for_password("Enter backup password", 0);
+			}
+		}
+
+		/* Perform local unpacking */
+		int result = local_unpack_backup(backup_directory, source_udid, is_encrypted ? backup_password : NULL);
+		if (backup_password) {
+			free(backup_password);
+		}
+		return result;
+	}
+#else
+	/* SQLite3 not available - need device connection for unback */
+	if (cmd == CMD_UNBACK) {
+		printf("NOTE: Local backup unpacking requires SQLite3 support.\n");
+		printf("This build was compiled without SQLite3. Falling back to device-based unpacking.\n");
+		printf("A device must be connected to continue.\n");
+	}
+#endif
 
 	ret = idevice_new_with_options(&device, udid, (use_network) ? IDEVICE_LOOKUP_NETWORK : IDEVICE_LOOKUP_USBMUX);
 	if (ret != IDEVICE_E_SUCCESS) {

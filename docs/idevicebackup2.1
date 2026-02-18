@@ -74,6 +74,9 @@ list files of last completed backup in CSV format.
 .TP
 .B unback
 unpack a completed backup in DIRECTORY/_unback_/
+.br
+Note: For modern unencrypted backups (iOS 10+), this works without a device connection.
+Encrypted backups and older formats require a connected device.
 .TP
 .B encryption on|off [PWD]
 enable or disable backup encryption. The password will be requested in
